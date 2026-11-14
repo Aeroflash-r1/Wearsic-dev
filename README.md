@@ -1,11 +1,413 @@
-<div align="center">
+# Wearsic — Wear OS 6 Music App
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+**Wearsic** is a lightweight and secure music streaming application engineered specifically for **Wear OS 6** smartwatches, fully optimized for the **Samsung Galaxy Watch7 (44mm)**.
 
-  <h1>Built with AI Studio</h2>
+---
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+## 🚀 Quick start (60 seconds)
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+**1. Install the server on your phone (Termux):**
+```bash
+curl -fsSL https://github.com/Aeroflash-r1/wearsic/releases/latest/download/wearsic-server-v1.9.48.sh -o wearsic-server.sh
+chmod +x wearsic-server.sh && ./wearsic-server.sh install
+wearsic start
+```
 
-</div>
+> Note: the installer bootstrap itself is downloaded over HTTPS but is not
+> content-pinned — review `install.sh` before piping it (the payload it
+> installs IS sha256-verified and staged with rollback).
+
+**2. Get the watch values:**
+```bash
+wearsic url        # shows the LAN address + API key
+```
+
+**3. Install the watch app** — download `Wearsic-v1.9.48.apk` from the [latest release](https://github.com/Aeroflash-r1/wearsic/releases/latest) and install it on the watch (via `wearsic sideload` with adb, or the Play-style sideload).
+
+**4. Pair the watch:** open Wearsic on the watch → Settings → enter the URL + key from step 2. All done — search and play.
+
+**Want music anywhere (not just home WiFi)?** run `wearsic cloudflare` once — you get a permanent `https://wearsic.<sub>.workers.dev` URL the watch remembers forever.
+
+> Tip: after `wearsic shortcuts` you can use one-word commands: `ws-start`, `ws-status`, `ws-cf`, …
+
+---
+
+## 📜 Architectural Overview
+
+Wearsic adopts a clean, modular Model-View-ViewModel (MVVM) architecture with structured data layers and service boundaries:
+
+```
+[ Wear OS Compose Screens ] (Rotary Scroll, M3 Touch Targets)
+         │
+         ▼
+[ WearsicPlayerViewModel ] (Cancellable Coroutine Jobs, StateFlow Engine)
+         │
+         ▼
+[ WearsicPlaybackController ] <══> [ WearsicMediaService ] (MediaSession, ExoPlayer)
+         │                                   │
+         ▼                                   ▼
+[ WearsicDownloadManager ]          [ WearsicStreamDataSource ]
+         │                             (in-memory buffering only —
+         ▼                              no on-disk stream cache)
+[ WearsicDownloadRepository ]              │
+(Room SQLite + ONE file per track   [ ExoPlayer ] (memory window)
+ under wearsic_downloads/)
+         │
+         ▼
+[ WearsicMusicRepository ] <══> [ WearsicHttpApiClient ]
+```
+
+### 1. Presentation & Interaction (Jetpack Compose for Wear OS)
+- **Rotary Scroll Input**: Uses a dedicated, zero-allocation custom `wearsicRotaryScroll()` modifier leveraging `FocusRequester` and `dispatchRawDelta` to translate physical crown and touch bezel movements directly into list movements and player seeks. Every list screen merges the system insets with the shared design padding via `wearsicListContentPadding()` (`ui/theme/WearsicDimens.kt`), so content always stays inside the circular safe area.
+- **Watch-First Touch Targets**: every tappable control carries at least a 44dp touch box (the `WearsicDimens.TouchTarget` token), including compact transport pills and song-row actions — visual size and tap area are decoupled so dense lists stay usable on the 44mm round display.
+- **Material Design 3 (Vibrant Palette)**: Deep black background (`#000000`), dark charcoal surfaces (`#1C1B1F`), and high-contrast Lavender accents (`#D0BCFF`). All colors/type live as named tokens in `ui/theme/Color.kt` — no scattered hex literals.
+- **Immersive visual hierarchy**: OLED-black canvases, section-colored header markers, rounded album-cover rows, and an artwork-backed Library shortcut. Shared typography, quiet borders, and compact surface-local gradients keep the music—not decoration—in focus.
+- **One motion system** (`ui/util/Motion.kt`): spring press feedback, brief screen/sheet entrances with density-correct translation, and shared click/long-press handling with haptics. Song rows do not replay entrance animations as lazy scrolling recycles them. Player motion is finite by design: a track change plays one short staggered entrance (art scales in, text rises) and the play/pause glyph pops on each state change — nothing animates while the user simply listens.
+- **Wear-native player (screen + sub-screen)**: the album artwork is the full-bleed background under a dark scrim; a 2-page pager holds Now Playing (album-art disc + metadata + transport, always visible — never scrolled to) and an Actions sub-screen (favourite/download/queue/output). The composition is centre-weighted for the round face, because the widest part of a circle is its middle: the art disc owns the centre, metadata sits in the readable mid-band, and the transport hugs the lower third. Progress is a ring drawn around the art, and every size derives from the measured viewport so a control can never leave the visible chord (short viewports automatically use a tighter scale). Controls and ring use colors extracted from decoded artwork off the main thread, with lavender fallback. A tappable 44dp page indicator exposes the scrollable Actions page. **The rotating bezel / crown slides between the pages** (a firm turn past a threshold switches; small turns are ignored), and dragging around the disc's ring scrubs to any point in the track — both are the primary controls on Samsung Galaxy Watch bezel devices.
+- **Consistent components & states**: screens share canonical empty/loading states (`WearsicEmptyState`, `WearsicLoadingState`), glass pills, headers and song rows, so loading/empty/error moments look identical everywhere.
+- **Settings that cannot eat your keystrokes**: the server URL and API key fields keep their edit local while focused and commit on Done/blur/leaving the screen; an async DataStore round-trip can never reset the text mid-typing, and invalid input is reported inline (never silently written over a working URL).
+- **Server Port setting**: a dedicated "Server Port" pill in Settings edits the port baked into the current server URL (1024–65535) without retyping the whole address — perfect for `wearsic port 9000`-style setups.
+- **Server profiles**: save the current server (URL + API key) as a named profile and switch between them (e.g. Home-LAN ↔ Cloudflare front door) in one tap; delete with confirmation.
+- **Automatic profile failover (app v1.9.48)**: when the active server is CONFIRMED unreachable (the same hysteresis that drives the offline banner, plus a confirming health ping), the app probes every OTHER saved profile in parallel and switches itself to the first healthy one — the same activating action Settings performs, without retyping anything on a 1.4" face. The Library screen then shows a "Switched to <name>" banner (it clears after a grace period so long uptime on the fallback does not read as normal), playback keeps working for all NEW loads, and there is no switch-back churn — restoring your preferred profile is one Settings tap when its server is home again. Failing rounds cool down for five minutes so a dead network is not re-probed on every tap.
+- **Offline surface**: when the server is unreachable the home screen flips to "Offline — showing saved music" and lists your completed downloads for instant playback — the app stays useful with no network.
+- **Queue reorder**: long-press an Up Next row and drag it up or down while the current track keeps playing. The drop slot is the row whose laid-out centre is nearest the lifted row's centre, so it stays accurate where `ScalingLazyColumn` shrinks rows at the curved edges. Reaching into a long queue auto-scrolls, but only after the finger deliberately pushes into an edge band and holds there (~180 ms); the row keeps its full width for the song name.
+- **Play all / Shuffle all**: one tap on Favorites (play all, shuffle) and Downloads (play all, offline library).
+- **Retry pills**: Search and Albums error states offer an inline Retry button for the same query.
+- **Dynamic Accent & Rotating Artwork**: opt-in toggles in Settings — accent that follows the album art, and the player disc's slow rotation (default on).
+- **Sound screen with a live volume dial**: media volume is observed from the system (crown overlay, earbud absolute volume, other apps all stay in sync), the physical crown adjusts it with a haptic tick per step, the dial taps to mute/unmute, and the real Bluetooth device name is shown when one is connected.
+- **Engine Dashboard**: a screen that probes `/health` + `/ready` and renders the server's live self-report — engine version, uptime, transcoder, extraction success/failure counters, canary probe, staged updates (with the staged release's notes, server ≥ v1.9.48), crash count and readiness — so problems are diagnosed from the wrist instead of a terminal.
+- **Status dashboard for browsers**: the engine also embeds a self-refreshing OLED-dark status page at `GET /` (see the API contract below) so the same self-report is readable from any phone or laptop without a terminal.
+- **Single-line, self-scrolling track title**: a long song name slides sideways instead of wrapping to a second line, so the artist line and transport never get pushed down and nothing clips at the curved edge — and the full name is still reachable.
+- **Recently Played is identity-exact**: recents rows are keyed by the stable track ID, never by title — two different recordings that share a title/artist stay separate rows and always replay their exact recording (regression-covered by `RecentPlaybackIdentityTest`).
+
+### 2. Playback Foundation (AndroidX Media3)
+- **Single ExoPlayer Instance**: Instantiated inside the lifecycle of `WearsicMediaService` (extending `MediaSessionService`).
+- **Natively Integrated MediaSession**: Exposes artwork, title, artist, play/pause, duration, seeks, and navigation directly to Wear OS system tiles, surfaces, and lock screens. Includes a secure `PendingIntent` for quick back-navigation to the main watch application.
+- **Audio Attributes**: Custom music profile (`C.AUDIO_CONTENT_TYPE_MUSIC` & `C.USAGE_MEDIA`) utilizing Android's native audio focus system and noisy-headset behavior (`setHandleAudioBecomingNoisy(true)`).
+
+### 3. Persistent Settings (Jetpack DataStore)
+- Backed by Jetpack `DataStore<Preferences>`.
+- **Fault Tolerance**: Read flows include `.catch` blocks to gracefully fall back to safe default settings if preference files are corrupted on the filesystem.
+- **Last-good-value writes**: blank input clears a setting deliberately; invalid input is dropped instead of stored, so a half-typed server URL can never overwrite the working one or disable playback mid-edit. The API key that is mirrored into the shared HTTP client is always the value the repository actually accepted.
+
+### 4. Downloads & Local Storage (Room Database & OKHttp)
+- **Room SQLite Store**: Tracks ownership per song — one row per track with a single `autoCached` flag: `true` = AUTO (evictable), `false` = MANUAL (permanent).
+- **ONE physical file per track**: every unique track maps to exactly one completed file (`wearsic_downloads/<trackId>.m4a`); the Room row decides whether it is AUTO or MANUAL — never two files, never two copies of a song.
+- **Isolation**: Downloading bytes are written to `.part` files and atomically renamed to the final `.m4a` only after success; a failed/cancelled download never leaves a `COMPLETED` record.
+- **Storage Protection**: StatFs check verifies that at least 15MB of storage remains free before beginning any download.
+- **AUTO -> MANUAL promotion is metadata-only**: pressing Download on an auto-cached song flips the flag and reuses the same file — 0 new bytes, no re-download. A Download press during an in-flight AUTO download upgrades that same job. MANUAL is never downgraded by AutoCache.
+- **No persistent stream cache**: playback buffers in ExoPlayer memory only — the 16 MB OkHttp disk cache added in v1.9.1 stores JSON API responses only, never audio. AutoCache (45s-listening deferral, 15/50/100-song configurable cap, oldest-first eviction that never touches MANUAL) is the sole way songs land on disk.
+- **Playback-safe deletion**: eviction, Clear auto-saved and individual deletes never cut the AUTO file ExoPlayer currently has open. That file's deletion is DEFERRED and persisted on the Room row (`pendingDeletion` flag, DB v4) — so the intent survives process death and a restart deterministically rediscovers it — then retried automatically once playback releases the file (track change, queue clear, or after startup once the session state is known). A playing song therefore temporarily survives cleanup but never bypasses the 15/50/100 cap forever, and a MANUAL download request racing a deletion always wins (promotion intent is recorded synchronously before any delete can run).
+- **Startup reconciliation**: rows left `QUEUED`/`DOWNLOADING` by a killed process are removed (with their orphaned `.part` bytes); legacy `CANCELLED` rows are rescued to `COMPLETED` when a real file exists behind them (ownership preserved) or removed when dead — never touching valid AUTO/MANUAL downloads; legacy `wearsic_playback_cache` directories from older builds are wiped once. All idempotent.
+
+---
+
+## 🌐 Expected Server API Contract
+
+This client is fully hardened to support any standard Ktor/OkHttp endpoint following the schema below.
+
+### 0. Engine Status Dashboard (server ≥ v1.9.48)
+- **Route**: `GET /` (any browser; public and secret-free like `/health`)
+- One self-contained OLED-dark page (the watch palette) that paints the engine's
+  CURRENT health + diag snapshot on first open and then self-refreshes over
+  `/health`, `/ready` and `/diag` every 5 s: readiness tiles, extraction health,
+  the update state with the staged release's notes, crash/CDN-refusal counters
+  and live latency percentiles. Served `Cache-Control: no-store`, gzipped when
+  accepted. Mirrored on the wrist by the Engine Dashboard screen.
+
+### 1. Health Verification
+- **Route**: `GET /health`
+- **Response Model** (self-healing fields are optional and ignored by older clients):
+```json
+{
+  "status": "ok",
+  "version": "1.9.48",
+  "serverName": "Wearsic Engine",
+  "transcoderAvailable": true,
+  "extraction": { "successCount": 42, "failureCount": 1, "failureRatePercent": 2, "consecutiveFailures": 0, "lastError": null },
+  "canaryHealthy": null,
+  "update": { "status": "idle", "latestKnownVersion": null, "lastCheckAtMillis": 0, "lastError": null, "stagedVersion": null }
+}
+```
+
+### 2. Music Search
+- **Route**: `GET /api/search?q={query}`
+- **Response Model** (the client derives stream URLs as `{server}/api/stream/{videoId}`):
+```json
+{
+  "results": [
+    {
+      "videoId": "track_1",
+      "title": "Weather with You",
+      "uploader": "Crowded House",
+      "durationMs": 240000,
+      "thumbnailUrl": "https://i.ytimg.com/vi/.../default.jpg"
+    }
+  ]
+}
+```
+
+### 3. Recommendations ("Made for you")
+- **Route**: `POST /api/recommendations`
+- **Request**: `{seedTrackIds, topArtists, excludeTrackIds}`
+- **Response**: `{ "results": [TrackDto...] }` (up to 25). Multi-seed YouTube
+  "related" pool, scored toward the user's top artists, cached 30 minutes.
+  See [API_CONTRACT.md](./API_CONTRACT.md) §7-b for the full contract.
+
+### 4. Media Stream
+- **Route**: `GET /api/stream/{videoId}`
+- **Response Stream**: Returns `audio/mp4` (YouTube AAC — the common case), `audio/webm` (Opus), or `audio/aac` (server-transcoded Opus/WebM-only songs) with support for HTTP range requests.
+
+---
+
+## 🔒 Security & Hardening Pass
+
+### 1. URL Sanitation & Scheme Enforcement
+- Trim and sanitize Server URLs entered by users.
+- Validates that schemes must start with `http://` or `https://` via strict `URI` check to prevent local file descriptor exposure. HTTPS is the expected default configuration for all production requests.
+
+### 2. Duplicate Request Prevention
+- Throttles connection testing by locking and skipping execution if `ConnectionTestState.Testing` is active.
+- Throttles search queries by canceling previous active search coroutines `searchJob?.cancel()`.
+- Throttles progress reporting during downloads (every 10% or 500ms) to reduce watch CPU and UI rendering overhead.
+- Ignores duplicate track download requests if a download job for that track ID is already active, and upgrades the SAME job when a MANUAL request lands on an in-flight AUTO download (no second HTTP request).
+
+### 3. Clean Error Translation
+- Translates raw networking/Media3 exceptions into short, actionable, Wear OS-friendly errors (e.g., "Server connection timed out.", "Host not resolved. Check URL or internet.", "Storage full (<15MB free)").
+
+### 4. Lifecycle & Coroutine Leak Protection
+- Releases `MediaController` and cancels the coroutine supervisor scope job inside `WearsicPlaybackController.release()` when screens or ViewModels clear.
+
+## 🎛️ Terminal experience
+- **One command, seven stages, no log spam.** The installer (`curl -fsSL …/install.sh | bash`) walks **Download → Install → Configure → Build → Start → Verify → Ready**. The active stage is the only thing on screen: its text shimmers — a soft gray wave that blends every character between base `#8A8A85` and highlight `#C9C9C3` by its distance from a highlight band travelling left → right, redrawn in place every ~90ms, one seamless pass every ~2.0s. Finished stages collapse into one quiet line each, printed exactly once. Sub-process output (package manager, unzip, Gradle) is captured internally and only surfaced when a step fails, so the terminal never fills with duplicate logs and a failure is never hidden.
+- **The shimmer is real, not a mock — and smooth.** Truecolor (`#8A8A85` → `#C9C9C3`) in Termux, a 256-colour gray ramp fallback (base **245**, highlight 253) elsewhere, `NO_COLOR` and non-TTY output stay plain, `TERM=dumb` disables it, and the cursor is hidden only while the wave is on screen — it is restored on every exit path, including errors and Ctrl+C. The live line is truncated to the terminal width, so a 40-column phone never sees a wrapped mess. The wave uses 22 frames per pass with a wider 40% band — **precomputed once per label and just printed per tick**, so the motion is pure terminal writes and stays smooth on a low-end phone.
+- **Everything follows the live terminal width.** Panels, rules and progress bars re-measure the terminal at render time (cached ~1s, invalidated on `SIGWINCH`), so rotating the phone or changing font mid-command never leaves misaligned boxes.
+- **Shorter commands.** `wearsic /start` ⇔ `wearsic start` (leading slash accepted), and `wearsic shortcuts` installs one-word `ws-start`, `ws-stop`, `ws-status`, `ws-logs`, `ws-health`, `ws-url`, `ws-ip`, `ws-pair`, `ws-update`, `ws-dashboard`, `ws-doctor`, `ws-cf`, `ws-funnel`, `ws-cookies` symlinks (never overwrites existing binaries).
+- **Custom server port**: `wearsic port` prints the configured port; `wearsic port 5861` validates and persists a new port (1024–65535) to `.env`, applied on `wearsic restart`. `url`, `pair`, `status`, `doctor` and the Cloudflare/funnel front doors all follow it.
+- **A live dashboard for the running server.** `wearsic dashboard` shows health, uptime, the LAN address, the Cloudflare front door and tunnel state, the API/stream health and the current engine activity — refreshed **in place** (no scrollback spam), with the same shimmer on active states and Ctrl+C to leave. `wearsic setup` re-runs the whole flow for an existing install (key → engine → health → watch values), with `--update` and `--cloudflare` options. Existing commands (`start`, `stop`, `restart`, `status`, `logs`, `doctor`, `update`, `health`, `url`, `api-key`, `pair`, `cloudflare`) keep their syntax and exit codes.
+- **A status page for browsers, too (server ≥ v1.9.48).** The engine itself serves an embedded, self-refreshing status dashboard at `GET /` — readiness, extraction health, the update state including the staged release's notes, CDN-refusal counters and latency percentiles, with the current snapshot embedded in the very first paint. Covered by `WebDashboardTest` (public HTML route, `no-store`, per-request boot-snapshot embedding), `MetadataRouteCacheTest` (per-key single-flight TTL caches on suggestions/related/album search, failures never cached) and `EngineUpdaterNotesTest` (release-notes preview shaping that travels with staged updates).
+- Covered by `wearsic-server/tests/shimmer-test.sh` (colour blending, frame timing, band direction, 256-colour fallback, `NO_COLOR`, non-TTY, cursor restoration including Ctrl+C, narrow terminals, the stage machine and the CLI/installer core sync), `wearsic-server/tests/cli-shortcuts-test.sh` (slash dispatch, `shortcuts`, `cur_cols` + WINCH re-measure) and `wearsic-server/tests/ui-layout-test.sh` in CI.
+
+## 🌐 Public Setup (exposing the server beyond your LAN)
+- **`wearsic funnel` distinguishes a dead daemon from a logged-out phone.** The old flow probed `tailscale status` to answer both "is tailscaled running?" and "am I authenticated?" — but that command exits non-zero in *both* cases, so the two were indistinguishable. A logged-out node was reported as `Tailscale daemon is not running. Try: tailscaled-start` (the wrong remedy), and the `tailscale up` branch was unreachable code that could never execute. `ts_state` now reads Tailscale's `BackendState` (`Running` / `NeedsLogin` / `Stopped` / `NoState`) and acts on each state, with a fallback for older builds that have no `--json`.
+- **A funnel failure is diagnosed, not dumped.** tailscale's own output still streams live, but it is also captured so the CLI can name the likely cause — HTTPS certificates disabled on the tailnet, a tailnet ACL blocking Funnel, or an unauthenticated node — and offer `cloudflared` as an alternative that needs no account.
+- **`wearsic cloudflare` gives a PERMANENT public URL, free, with no domain.** A Cloudflare Quick Tunnel is the fastest public path available — the watch talks to Cloudflare's edge, not to a Tailscale DERP relay — but its hostname is random and changes on every restart, so the watch can never remember it. `wearsic cloudflare` puts a Cloudflare **Worker** in front of the tunnel: the Worker lives at a fixed `https://wearsic.<subdomain>.workers.dev` address and is re-uploaded with the new tunnel hostname whenever the tunnel changes, so the permanent address never breaks and the watch is never re-paired. The reviewed Worker source is uploaded verbatim (there is no generated "Hello World" fallback); the CLI also enables its `workers.dev` route, because API-created Workers are private until that route is turned on. The Worker streams responses, preserves `Range`/206/`Content-Range`, `Content-Length`, multiple `Set-Cookie` headers and the API key, rewrites same-origin redirects to the permanent host, and returns opaque error bodies. The supervisor truncates the per-tunnel log before each start, waits for the new origin to answer `/health`, retries only network/5xx/429 deployments with bounded exponential backoff and jitter, stops on a permanent 4xx, keeps the discovered `origin` separate from the last accepted `deployed_origin`, and restarts the tunnel/re-points the Worker when either one fails.
+- **Cloudflare setup is one command, even on a fresh install.** `wearsic cloudflare` starts the engine if it is stopped, creates a 48-character hex API key only when none is saved (an existing key is never replaced), authorizes with `wearsic cloudflare login` — a native, wrangler-compatible OAuth session (device flow by default, `--browser` PKCE flow on bot-challenged networks) where you approve once in the browser and the refresh token keeps the session alive forever, no `npm`/wrangler install needed; `--wrangler` and `--token-stdin` (paste a scoped token) remain as fallbacks — then installs `cloudflared`, deploys and verifies the Worker, and ends with a single card containing both the permanent URL and API key for the watch. `wearsic cloudflare login`, `wearsic api-key <key>` and `wearsic start` remain available for people who want to control each step. The account ID is auto-detected and persisted, an existing `workers.dev` subdomain is reused, and one is created only when the account has none. `status` reports health and auth through the permanent URL, `verify` proves auth + Range/206 using `GET /api/frontdoor/probe`, `logs` redacts secrets, and `stop` leaves the Worker and URL deployed. A real-track check is opt-in with `WEARSIC_CF_PLAYBACK_ID`; setup success is never inferred from `/health` alone. Covered by `wearsic-server/tests/cloudflare-tunnel-test.sh` (offline unit/guardrail checks), `wearsic-server/tests/worker-proxy-test.mjs` (Worker header/streaming/redirect contract), `FrontDoorProbeTest` (engine probe contract) and `wearsic-server/tests/cloudflare-e2e-test.sh` (the real CLI and engine behind a mocked Cloudflare edge, including retry and tunnel-restart recovery), all in CI.
+- **Cloudflare on native Termux is fixed.** The GitHub cloudflared build is glibc and dies instantly on Termux's bionic libc; the CLI now installs and uses the Termux package (`pkg install cloudflared`) automatically. If a tunnel still exits immediately, the CLI reports the real cloudflared error line (DNS/CA bind, token rejection, …) instead of silently re-minting tunnels and burning the quick-tunnel rate limit. The Worker also passes the engine's `Cache-Control` through on JSON endpoints, so the watch's disk cache keeps working over the permanent URL.
+- **`wearsic doctor` explains itself.** "installed, not connected" became "installed, not logged in — for a public URL run: tailscale up", and Funnel reports `blocked: Tailscale not connected` instead of a second confusing failure. Tailscale stays a *warning*, never a failure: the server serves music over LAN without it, so a logged-out phone must not make `doctor` report NOT READY.
+- Covered by `wearsic-server/tests/funnel-state-test.sh` (offline, fakes the `tailscale` binary, runs in CI).
+- **`wearsic pair` removes the watch keyboard from setup.** Typing a 24-character address and an API key on a 1.4" screen was the most error-prone part of pairing; `wearsic pair` (or `--funnel`) probes the address first — a stopped server or dead Funnel is caught on the phone — then delivers a two-line pairing file over adb. The watch app (v1.9.2 and newer) imports it on the next launch, confirms with a toast and deletes the file.
+- Covered by `wearsic-server/tests/pair-test.sh` (offline, fakes adb + curl + tailscale, runs in CI).
+
+## Performance (watch smoothness)
+- **Cold-start critical section**: the first frame is a trivial backdrop; the real UI composes on the next frame, so the system splash (and its ANR window) is never gated on building ViewModels, repositories and the nav graph.
+- **No recomposition from position ticks**: the navigation host holds playback/download states as raw `State`s and exposes `derivedStateOf` projections that zero the ticking fields — the 1 Hz position tracker used to recompose all 12 reachable screens (~1800 no-op emissions/hour, now zero).
+- **Watch-tuned image loading**: Coil's memory cache capped at 10% of the watch heap, 64 MB disk cache, and row thumbnails requested at 112 px with a `remember`ed request (no load restarts on press redraws).
+- **Leaner playback buffers**: ExoPlayer buffers 15 s/50 s in memory with a 2 MB hard backstop (the largest heap allocation the player holds) — a deep enough runway to ride out WiFi jitter without growing unbounded on a watch.
+- **Stalls resume in 2.5 s, not 5 s**: `bufferForPlayback` 800 ms and `bufferForPlaybackAfterRebuffer` 2500 ms. The old 1500 ms/5000 ms values were the main reason playback *felt* laggy — the player sat silent for a full five seconds after any interruption, even on a fast link.
+- **Stream reads never hard-cut a song**: the stream data source clears OkHttp's whole-call timeout and uses a 60 s per-read inactivity timeout, so songs longer than the base client's 45 s call budget no longer stop mid-playback.
+- **Sockets survive WiFi roaming**: the stream client retries a dropped connection (a watch hopping access points no longer surfaces as a buffering error) with a 15 s write timeout so a real outage still fails fast.
+- **64 KB proxy chunks**: the server copies CDN bytes to the watch in 64 KB blocks instead of Ktor's 8 KB default. `AudioProxyThroughputTest` measures this end-to-end over the real CIO stack (origin server → real module route → HTTP client). On this machine, 6 MB took **657 ms at 8 KB vs 523 ms at 64 KB (1.26x)**; 256 KB was faster still (382 ms). Honest caveat: those figures are loopback throughput, and real AAC streams at ~128 kbps need ~0.016 MB/s — roughly 500x less than the proxy already pushes at 8 KB. So this reduces CPU and syscalls, but it is **not** what makes playback feel fast; the buffering thresholds above are. 64 KB is kept as the balance point.
+- **Playback warm-up is free over Funnel**: on tap (and for the next queue item) the watch calls `/api/prewarm/{id}` to resolve the track without transferring audio. The previous probe was a `Range: bytes=0-0` request to `/api/stream`; because the proxy runs tiny windows to their natural EOF, that relayed a full song through Tailscale before the client hang-up was noticed — competing with the real playback request and discarding the connection. `/api/prewarm` answers with a few bytes of JSON and leaves the TCP+TLS connection in the pool for the stream, and it is rate-limited separately from playback.
+- **Funnel round trips carry less on the wire**: the server gzips JSON responses (content-type allow-list, ≥512 bytes — audio is never recompressed, so streams stay byte-exact for Range/seek). Search results, album/playlist listings and favorites shrink ~3–5×, which matters on a relayed Tailscale Funnel link where every byte is metered through a DERP.
+- **Repeat screens paint from disk, not from the relay**: the watch keeps a 16 MB HTTP response cache for exactly the read endpoints that repeat — search, suggestions, related and album/playlist listings (5 min freshness), favorites/playlists (5 s). Re-opening a screen over Funnel becomes a disk hit instead of a 50–150 ms round trip. After a favorite/playlist edit the app flips to `Cache-Control: no-cache` for 6 s, longer than the 5 s freshness window, so a user can never be shown their own pre-mutation list. Audio is never cached (no cache headers on `/api/stream`).
+
+## Relaunch Reliability (no more stuck splash on reopen)
+- **Swiping the app away no longer tears down the media session**: playback keeps running in the background (Wear OS media notification), and the next app launch connects to a live session instantly instead of inheriting a half-released one.
+- **Self-healing media service**: if the service is ever alive with a missing session, `onGetSession` rebuilds the player + session instead of returning `null` (which used to wedge every future `MediaController.connect()` and hang the splash).
+- **Bounded session connect**: `buildAsync` has a 15s watchdog — a future that never resolves is released and reconnects are scheduled, so the app never waits forever; startup storage reconciliation uses the same bound.
+- **Crash containment**: a transient Room/IO error in the playback-state collector is logged and skipped instead of crash-looping the app on every relaunch (covered by `RelaunchWithDataTest`).
+
+---
+
+## 🗺️ Completed Milestones
+
+- [x] **Milestone 1**: Wear OS 6 UI Foundation & Styling
+- [x] **Milestone 2**: AndroidX Media3 Audio Playback Engine
+- [x] **Milestone 3**: Server/API Client & Persistent Datastore Settings
+- [x] **Milestone 4**: Caching & Room Local SQLite Downloads Store
+- [x] **Milestone 5**: Native Wear OS Media Integration, Rotary Input & Layout Optimization
+- [x] **Milestone 6**: Reliability, Security & Production Hardening
+- [x] **Milestone 7**: Final Release & Daily-Use Validation
+
+---
+
+## 📡 API Contract & Server Architecture
+
+The Wearsic watch application is a **lightweight streaming client**. To protect the watch's battery, processor, and cellular data consumption:
+- All heavy work — metadata search (YouTube Music-first), YouTube extraction via NewPipeExtractor, and on-the-fly ffmpeg transcoding — happens in the **Wearsic Ktor server** (`wearsic-server/`, the canonical source implementation).
+- The watch communicates with the server via the stable HTTP API documented in [API_CONTRACT.md](./API_CONTRACT.md).
+- To run the server on a spare Android phone with Termux, follow [TERMUX_SERVER_GUIDE.md](./TERMUX_SERVER_GUIDE.md).
+
+---
+
+## 🛠️ How to Build & Run Tests
+
+### Compile Project
+```bash
+./gradlew assembleDebug
+```
+
+### Run Test Suites
+```bash
+./gradlew :app:testDebugUnitTest   # app Robolectric tests
+./gradlew :wearsic-server:test     # server unit/integration tests
+```
+
+---
+
+## 🤖 CI / Releases (GitHub Actions)
+
+`.github/workflows/android.yml` runs on pushes to `main`, `v*` tag pushes, pull requests, and manual dispatches:
+
+1. **test** — app Robolectric tests, `:wearsic-server:test`, the offline CLI
+   shell suites (funnel/Tailscale state detection, `update --pre` resolution,
+   `sideload` asset + adb selection, the Cloudflare front door — unit checks
+   and a real end-to-end run against a mocked Cloudflare edge), and a
+   Roborazzi render of every
+   reachable screen (uploaded as the `screen-gallery` artifact) — a broken
+   server cannot merge silently while Android tests pass.
+2. **build-debug** — unsigned debug APK uploaded as a workflow artifact.
+3. **release** — runs on `main` pushes and `v*` tags, but only tag pushes
+   publish the GitHub Release. Builds the signed release APK **and** the
+   server in two shapes, all attached to the GitHub Release and verified by
+   booting + checking `/health` (and re-verifying the published checksum)
+   before publishing:
+   `wearsic-server-<tag>.sh` (**single file** — the whole server inside one
+   download, installed and managed with one `wearsic` command), the
+   source-built ZIP (`wearsic-server-termux-<tag>.zip`) and its
+   **SHA-256 checksum** (`wearsic-server-termux-<tag>.zip.sha256` — the
+   server's auto-updater refuses to install any release without one).
+   The watch APK ships its own **SHA-256** (`Wearsic-<tag>.apk.sha256`);
+   `wearsic sideload` (Termux CLI) verifies it before installing the app
+   onto the watch over adb.
+
+### Pre-releases
+
+Releases ship as **normal GitHub releases** (`RELEASE_PRERELEASE: ""` in the
+release job), so plain `wearsic update` can actually see them. Set it to
+`"true"` to cut a beta instead — betas are then reachable only via
+`wearsic update --pre`. This is enforced end-to-end, not just a label:
+
+| Reader | Endpoint | Pre-release behaviour |
+|---|---|---|
+| `wearsic update` (Termux CLI) | `releases/latest` | Excluded by GitHub itself. |
+| `wearsic update --pre` (Termux CLI) | `releases?per_page=10` | **Includes** pre-releases — opt-in per run. |
+| `EngineUpdater::checkForUpdate` (phone auto-update) | `releases?per_page=10` | **Includes** pre-releases — so the server filters `prerelease`/`draft` itself. |
+
+Without that third filter, tagging a beta as a pre-release would still
+auto-install it onto every existing phone within the check interval, making
+the pre-release flag cosmetic. `EngineUpdaterPrereleaseTest` covers it.
+To cut the next version as a beta instead, set `RELEASE_PRERELEASE: "true"`.
+
+**Updating to a pre-release.** Because GitHub's `releases/latest` excludes
+pre-releases, a plain `wearsic update` keeps serving the newest *stable*
+build even while a newer beta exists. To pull the beta:
+
+```bash
+wearsic update --pre
+```
+
+`--pre` walks the release list instead and installs the newest release that
+actually has a server package. Drafts and releases shipping no package are
+skipped. SHA-256 verification and rollback are unchanged — a pre-release is
+verified exactly like a stable one.
+
+To install a specific build without touching the CLI at all:
+
+```bash
+WEARSIC_ZIP_URL=https://github.com/Aeroflash-r1/wearsic/releases/download/v1.9.48/wearsic-server-termux-v1.9.48.zip \
+  wearsic update
+```
+
+`update-pre-test.sh` pins this resolution logic offline (faking `curl`).
+
+One-time setup for releases — add these repository **secrets**:
+
+| Secret | Value |
+|---|---|
+| `KEYSTORE_BASE64` | `base64 -w0 my-upload-key.jks` output |
+| `STORE_PASSWORD` | Keystore password |
+| `KEY_PASSWORD` | Key password |
+
+Create a keystore locally with:
+
+```bash
+keytool -genkeypair -v -keystore my-upload-key.jks -alias upload \
+  -keyalg RSA -keysize 2048 -validity 10000
+```
+
+Then cut a release:
+
+```bash
+git tag v1.9.48 && git push origin v1.9.48
+```
+
+### One-button extractor hotfix (when YouTube breaks)
+
+When YouTube changes break extraction, the fix is almost always a newer
+NewPipeExtractor — and shipping it is one button press:
+
+**Actions → Extractor Hotfix → Run workflow**
+
+The workflow resolves the newest NewPipeExtractor release (or takes an
+exact ref: a version, a commit, or `master-SNAPSHOT` when upstream merged a
+fix but hasn't released it), rewrites the pin + versions, then gates
+everything on the offline bump-script test, the full server unit suite, and
+a **live dual-path smoke** against real YouTube (extracts "Me at the zoo"
+through both NewPipeExtractor and the production resolver; real bytes pulled
+from each) — nothing is pushed when a gate fails. Only then does it commit,
+tag `vX.Y.Z`, push, and dispatch Android CI on the tag: CI publishes the
+release (zip + `.sha256`) and every installed server auto-installs it within
+minutes — no phone interaction.
+
+| Dispatch input | When to use it |
+|---|---|
+| `dry_run` | prove the whole pipeline + see the diff, ship nothing |
+| `emergency_override` | ship even if the live smoke fails (CI datacenter IPs can hit YouTube bot-walls) |
+| `mode=branch` | the fix is our own resolver code — release the current tip as-is |
+
+> **CI bot-wall:** GitHub's runner IPs are sometimes challenged by YouTube
+> (`SignInConfirmNotBotException` in the smoke log). Either tick
+> `emergency_override`, or better, add a repo secret `YT_COOKIE` with the
+> same cookie string as `wearsic cookies` — the live smoke then runs
+> cookie-backed and the gate stays honest.
+
+> **First-time setup:** GitHub only shows the Run-workflow button for files
+> that exist on `main` — this workflow must be cherry-picked/merged there
+> before the button appears.
+
+## 📄 License
+
+Wearsic is open source software with **two components under two different licenses**:
+
+| Component | Path | License |
+| :--- | :--- | :--- |
+| Wear OS application (the watch app) | [`app/`](./app) | **Apache License 2.0** ([LICENSE](./LICENSE)) |
+| Wearsic server (backend) | [`wearsic-server/`](./wearsic-server) | **GPL-3.0-only** ([wearsic-server/LICENSE](./wearsic-server/LICENSE)) |
+
+The two components are separate works that communicate over HTTP, so each
+carries its own license. The Apache-2.0 license in [`LICENSE`](./LICENSE)
+covers the Wear OS application only, and the GPL-3.0-only license in
+[`wearsic-server/LICENSE`](./wearsic-server/LICENSE) covers the server only —
+the GPL does **not** apply to the Wear OS application, and the Apache-2.0
+license does **not** apply to the server.
+
+### Wear OS application — Apache-2.0
+
+You may use, modify, and redistribute the app under the terms of the Apache
+License 2.0. If you redistribute Wearsic or derivative works, retain the
+required copyright, license, and attribution notices.
+
+### Wearsic server — GPL-3.0-only
+
+The server is free software licensed under the GNU General Public License,
+version 3 **only** (`GPL-3.0-only`) — not any later version of the GPL. The
+complete license text is in
+[`wearsic-server/LICENSE`](./wearsic-server/LICENSE).
+
+### Third-party components
+
+The repository includes third-party attribution guidance in [NOTICE](./NOTICE).
+
+> **Important:** Wearsic includes third-party dependencies and tools that remain subject to their own licenses. Neither the Apache-2.0 license nor the GPL-3.0-only license relicenses those components. In particular, the server depends on [NewPipeExtractor](https://github.com/TeamNewPipe/NewPipeExtractor), which is itself GPL-3.0. Review the applicable dependency licenses before redistribution.
